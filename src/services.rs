@@ -17,90 +17,18 @@ use crate::models::{OutdatedPackage, Package, PackageSource};
 use crate::search::EnhancedSearch;
 use crate::traits::{PackageProvider, UpdateProvider};
 
-/// Circuit breaker for AUR API
-static AUR_CIRCUIT_BREAKER: Lazy<CircuitBreaker> = Lazy::new(CircuitBreaker::new);
-
-/// Circuit breaker for AUR API calls to prevent flooding when service is down
-pub struct CircuitBreaker {
-    failure_count: std::sync::atomic::AtomicU32,
-    last_failure: std::sync::atomic::AtomicU64,
-    state: std::sync::atomic::AtomicU32,
-}
-
-impl CircuitBreaker {
-    pub const FAILURE_THRESHOLD: u32 = 5;
-    pub const RECOVERY_SECS: u64 = 30;
-    pub const STATE_CLOSED: u32 = 0;
-    pub const STATE_OPEN: u32 = 1;
-    pub const STATE_HALF_OPEN: u32 = 2;
-
-    pub fn new() -> Self {
-        Self {
-            failure_count: std::sync::atomic::AtomicU32::new(0),
-            last_failure: std::sync::atomic::AtomicU64::new(0),
-            state: std::sync::atomic::AtomicU32::new(Self::STATE_CLOSED),
-        }
-    }
-
-    pub fn is_available(&self) -> bool {
-        let state = self.state.load(std::sync::atomic::Ordering::SeqCst);
-        match state {
-            Self::STATE_CLOSED => true,
-            Self::STATE_OPEN => {
-                let last_fail = self.last_failure.load(std::sync::atomic::Ordering::SeqCst);
-                let elapsed = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-                    - last_fail;
-                if elapsed > Self::RECOVERY_SECS {
-                    self.state
-                        .store(Self::STATE_HALF_OPEN, std::sync::atomic::Ordering::SeqCst);
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::STATE_HALF_OPEN => true,
-            _ => false,
-        }
-    }
-
-    pub fn record_success(&self) {
-        self.failure_count
-            .store(0, std::sync::atomic::Ordering::SeqCst);
-        self.state
-            .store(Self::STATE_CLOSED, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    pub fn record_failure(&self) {
-        let count = self
-            .failure_count
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        self.last_failure
-            .store(now, std::sync::atomic::Ordering::SeqCst);
-
-        if count >= Self::FAILURE_THRESHOLD {
-            self.state
-                .store(Self::STATE_OPEN, std::sync::atomic::Ordering::SeqCst);
-            tracing::warn!(
-                "Circuit breaker opened due to {} consecutive failures",
-                count
-            );
-        }
-    }
-}
-
-impl Default for CircuitBreaker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// Import providers from backends
+pub use crate::backends::providers::apk::ApkProvider;
+pub use crate::backends::providers::apt::AptProvider;
+pub use crate::backends::providers::aur::AurProvider;
+pub use crate::backends::providers::brew::BrewProvider;
+pub use crate::backends::providers::cargo::CargoProvider;
+pub use crate::backends::providers::dnf::DnfProvider;
+pub use crate::backends::providers::npm::NpmProvider;
+pub use crate::backends::providers::pacman::PacmanProvider;
+pub use crate::backends::providers::pip::PipProvider;
+pub use crate::backends::providers::scoop::ScoopProvider;
+pub use crate::backends::providers::zypper::ZypperProvider;
 
 /// Thread-safe search result cache
 pub struct SearchCache {
@@ -144,718 +72,25 @@ impl Default for SearchCache {
     }
 }
 
-/// Pacman package provider implementation
-pub struct PacmanProvider;
-
-impl Default for PacmanProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PacmanProvider {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-#[async_trait]
-impl PackageProvider for PacmanProvider {
-    async fn search(&self, query: &str) -> Result<Vec<Package>> {
-        let query = query.to_string();
-        tokio::task::spawn_blocking(move || Self::search_blocking(&query))
-            .await
-            .map_err(|e| AppError::Other(format!("Join error: {}", e)))?
-    }
-
-    async fn is_installed(&self, pkg_name: &str) -> bool {
-        let pkg_name = pkg_name.to_string();
-        match tokio::task::spawn_blocking(move || {
-            Command::new("pacman")
-                .arg("-Qi")
-                .arg(&pkg_name)
-                .output()
-                .map(|o| o.status.success())
-        })
-        .await
-        {
-            Ok(Ok(result)) => result,
-            Ok(Err(e)) => {
-                tracing::warn!("Failed to check if package is installed: {}", e);
-                false
-            }
-            Err(e) => {
-                tracing::warn!("Failed to join is_installed task: {}", e);
-                false
-            }
-        }
-    }
-}
-
-impl PacmanProvider {
-    /// Blocking search implementation
-    fn search_blocking(query: &str) -> Result<Vec<Package>> {
-        let output = Command::new("pacman")
-            .arg("-Ss")
-            .arg(query)
-            .output()
-            .map_err(|e| AppError::Pacman(format!("Failed to execute pacman search: {}", e)))?;
-
-        if !output.status.success() {
-            // Check if it's just no results vs an actual error
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("no results") || output.status.code() == Some(1) {
-                return Ok(Vec::new());
-            }
-            return Err(AppError::Pacman(format!(
-                "pacman search failed: {}",
-                stderr
-            )));
-        }
-
-        let stdout = String::from_utf8(output.stdout)
-            .map_err(|e| AppError::Pacman(format!("Invalid UTF-8 in pacman output: {}", e)))?;
-
-        let mut packages = Vec::new();
-        let mut lines = stdout.lines();
-
-        while let Some(header) = lines.next() {
-            if let Some(desc) = lines.next() {
-                if let Some(pkg) = Self::parse_entry(header, desc) {
-                    packages.push(pkg);
-                }
-            }
-        }
-
-        Ok(packages)
-    }
-
-    /// Parse a pacman package entry from command output
-    fn parse_entry(header: &str, desc: &str) -> Option<Package> {
-        // Header format: repo/name version (groups) [installed]
-        // Example: core/linux 6.6.1-arch1 (base) [installed]
-        let parts: Vec<&str> = header.split_whitespace().collect();
-        if parts.len() < 2 {
-            return None;
-        }
-
-        let full_name = parts[0]; // repo/name
-        let version = parts[1];
-        let is_installed = header.contains("[installed]") || header.contains("[Installed]");
-
-        let name = full_name.split('/').nth(1).unwrap_or(full_name).to_string();
-
-        Some(Package {
-            name,
-            version: version.to_string(),
-            description: desc.trim().to_string(),
-            source: PackageSource::Pacman,
-            is_installed,
-            is_outdated: false,
-            installed_size: None,
-            download_size: None,
-            groups: vec![],
-            licenses: vec![],
-            maintainers: vec![],
-            keywords: vec![],
-            url: None,
-            depends_on: vec![],
-            required_by: vec![],
-            opt_depends: vec![],
-            conflicts: vec![],
-            replaces: vec![],
-            provides: vec![],
-            votes: None,
-            popularity: None,
-            first_submitted: None,
-            last_updated: None,
-            package_base_id: None,
-            num_votes: None,
-        })
-    }
-}
-
-/// AUR package provider implementation
-pub struct AurProvider {
-    client: reqwest::Client,
-}
-
-impl Default for AurProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl AurProvider {
-    pub fn new() -> Self {
-        use crate::constants::network::{
-            AUR_CONNECT_TIMEOUT_SECS, AUR_REQUEST_TIMEOUT_SECS, HTTP_IDLE_TIMEOUT_SECS,
-            HTTP_MAX_CONNECTIONS,
-        };
-
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(AUR_REQUEST_TIMEOUT_SECS))
-            .connect_timeout(Duration::from_secs(AUR_CONNECT_TIMEOUT_SECS))
-            .pool_max_idle_per_host(HTTP_MAX_CONNECTIONS as usize)
-            .pool_idle_timeout(Duration::from_secs(HTTP_IDLE_TIMEOUT_SECS))
-            .tcp_keepalive(Duration::from_secs(60))
-            .tcp_nodelay(true)
-            .build()
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    "Failed to create optimized HTTP client: {}, using default",
-                    e
-                );
-                reqwest::Client::new()
-            });
-        Self { client }
-    }
-}
-
-#[async_trait]
-impl PackageProvider for AurProvider {
-    async fn search(&self, query: &str) -> Result<Vec<Package>> {
-        // Check circuit breaker first
-        if !AUR_CIRCUIT_BREAKER.is_available() {
-            tracing::warn!("AUR circuit breaker is open, skipping request");
-            return Err(AppError::Aur(
-                "AUR service temporarily unavailable (circuit breaker open)".to_string(),
-            ));
-        }
-
-        let url = format!(
-            "https://aur.archlinux.org/rpc/v5/search/{}",
-            urlencoding::encode(query)
-        );
-
-        const MAX_RETRIES: usize = 3;
-        let mut response = None;
-        let mut last_error = None;
-        for attempt in 0..MAX_RETRIES {
-            match self
-                .client
-                .get(&url)
-                .header("User-Agent", "metapak/0.1.0")
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    response = Some(resp);
-                    break;
-                }
-                Err(e) => {
-                    last_error = Some(e.to_string());
-                    if attempt + 1 < MAX_RETRIES {
-                        tokio::time::sleep(Duration::from_millis(250 * (attempt as u64 + 1))).await;
-                    }
-                }
-            }
-        }
-
-        // Record result in circuit breaker
-        if response.is_none() {
-            AUR_CIRCUIT_BREAKER.record_failure();
-        } else {
-            AUR_CIRCUIT_BREAKER.record_success();
-        }
-
-        let response = response.ok_or_else(|| {
-            AppError::Aur(format!(
-                "Failed to send AUR request after {} attempts: {}",
-                MAX_RETRIES,
-                last_error.unwrap_or_else(|| "unknown error".to_string())
-            ))
-        })?;
-
-        if !response.status().is_success() {
-            return Err(AppError::Aur(format!(
-                "AUR request failed with status {}",
-                response.status()
-            )));
-        }
-
-        let aur_response: AurResponse = response
-            .json()
-            .await
-            .map_err(|e| AppError::Aur(format!("Failed to parse AUR response: {}", e)))?;
-
-        let packages: Vec<Package> = aur_response
-            .results
-            .into_iter()
-            .map(|aur_pkg| {
-                let mut all_deps = Vec::new();
-                if let Some(depends) = aur_pkg.depends {
-                    all_deps.extend(depends);
-                }
-                if let Some(make_depends) = aur_pkg.make_depends {
-                    all_deps.extend(make_depends);
-                }
-
-                let is_outdated = aur_pkg.out_of_date.is_some();
-                let package_base_id = aur_pkg.package_base_id.map(|id| id.to_string());
-
-                Package {
-                    name: aur_pkg.name,
-                    version: aur_pkg.version,
-                    description: aur_pkg.description.unwrap_or_default(),
-                    source: PackageSource::Aur,
-                    is_installed: false,
-                    is_outdated,
-                    installed_size: None,
-                    download_size: None,
-                    groups: vec![],
-                    licenses: aur_pkg.licenses.unwrap_or_default(),
-                    maintainers: aur_pkg.maintainer.map(|m| vec![m]).unwrap_or_default(),
-                    keywords: aur_pkg.keywords.unwrap_or_default(),
-                    url: aur_pkg.url,
-                    depends_on: all_deps,
-                    required_by: vec![],
-                    opt_depends: aur_pkg.opt_depends.unwrap_or_default(),
-                    conflicts: aur_pkg.conflicts.unwrap_or_default(),
-                    replaces: vec![],
-                    provides: aur_pkg.provides.unwrap_or_default(),
-                    votes: aur_pkg.num_votes,
-                    popularity: aur_pkg.popularity,
-                    first_submitted: aur_pkg.first_submitted,
-                    last_updated: aur_pkg.last_updated,
-                    package_base_id,
-                    num_votes: aur_pkg.num_votes,
-                }
-            })
-            .collect();
-
-        Ok(packages)
-    }
-
-    async fn is_installed(&self, pkg_name: &str) -> bool {
-        let pkg_name = pkg_name.to_string();
-        match tokio::task::spawn_blocking(move || {
-            Command::new("pacman")
-                .arg("-Qm")
-                .arg(&pkg_name)
-                .output()
-                .map(|o| o.status.success())
-        })
-        .await
-        {
-            Ok(Ok(result)) => result,
-            Ok(Err(e)) => {
-                tracing::warn!("Failed to check AUR package installation status: {}", e);
-                false
-            }
-            Err(e) => {
-                tracing::warn!("Failed to join AUR is_installed task: {}", e);
-                false
-            }
-        }
-    }
-}
-
-/// NPM package provider implementation
-pub struct NpmProvider {
-    client: reqwest::Client,
-}
-
-impl Default for NpmProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl NpmProvider {
-    pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .user_agent("metapak/0.1.0")
-            .build()
-            .unwrap_or_else(|e| {
-                tracing::warn!("Failed to create NPM HTTP client: {}, using default", e);
-                reqwest::Client::new()
-            });
-        Self { client }
-    }
-
-    fn parse_npm_response(npm_response: NpmResponse) -> Vec<Package> {
-        npm_response
-            .objects
-            .into_iter()
-            .map(|obj| {
-                let pkg = obj.package;
-                let mut keywords = pkg.keywords.unwrap_or_default();
-                keywords.push("npm".to_string());
-
-                let mut maintainers = Vec::new();
-                if let Some(publisher) = pkg.publisher {
-                    if let Some(user) = publisher.username {
-                        maintainers.push(user);
-                    }
-                }
-
-                if let Some(npm_maintainers) = pkg.maintainers {
-                    for m in npm_maintainers {
-                        if let Some(username) = m.username {
-                            if !maintainers.contains(&username) {
-                                maintainers.push(username);
-                            }
-                        }
-                    }
-                }
-
-                let licenses = pkg.license.map(|l| vec![l]).unwrap_or_default();
-
-                Package {
-                    name: pkg.name,
-                    version: pkg.version,
-                    description: pkg.description.unwrap_or_default(),
-                    source: PackageSource::Npm,
-                    is_installed: false,
-                    url: pkg.links.and_then(|l| l.npm),
-                    keywords,
-                    maintainers,
-                    licenses,
-                    ..Default::default()
-                }
-            })
-            .collect()
-    }
-}
-
-#[async_trait]
-impl PackageProvider for NpmProvider {
-    async fn search(&self, query: &str) -> Result<Vec<Package>> {
-        let url = format!(
-            "https://registry.npmjs.org/-/v1/search?text={}&size=50",
-            urlencoding::encode(query)
-        );
-
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| AppError::Npm(format!("NPM request failed: {}", e)))?;
-
-        if !response.status().is_success() {
-            return Err(AppError::Npm(format!(
-                "NPM request failed with status {}",
-                response.status()
-            )));
-        }
-
-        let npm_response: NpmResponse = response
-            .json()
-            .await
-            .map_err(|e| AppError::Npm(format!("Failed to parse NPM response: {}", e)))?;
-
-        Ok(Self::parse_npm_response(npm_response))
-    }
-
-    async fn is_installed(&self, pkg_name: &str) -> bool {
-        let pkg_name = pkg_name.to_string();
-        match tokio::task::spawn_blocking(move || {
-            Command::new("npm")
-                .args(["list", "-g", "--depth=0", &pkg_name])
-                .output()
-                .map(|o| o.status.success())
-        })
-        .await
-        {
-            Ok(Ok(result)) => result,
-            _ => false,
-        }
-    }
-}
-
-/// Cargo package provider implementation
-pub struct CargoProvider;
-
-impl Default for CargoProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CargoProvider {
-    pub fn new() -> Self {
-        Self
-    }
-
-    fn parse_cargo_search(stdout: &str) -> Vec<Package> {
-        let mut packages = Vec::new();
-        for line in stdout.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with("...") {
-                continue;
-            }
-
-            // Format: name = "version" # description
-            if let Some((name_ver, desc)) = line.split_once(" # ") {
-                if let Some((name, ver)) = name_ver.split_once(" = ") {
-                    let name = name.trim().to_string();
-                    let version = ver.trim().trim_matches('"').to_string();
-                    packages.push(Package {
-                        name,
-                        version,
-                        description: desc.trim().to_string(),
-                        source: PackageSource::Cargo,
-                        ..Default::default()
-                    });
-                }
-            } else if let Some((name, ver)) = line.split_once(" = ") {
-                let name = name.trim().to_string();
-                let version = ver.trim().trim_matches('"').to_string();
-                packages.push(Package {
-                    name,
-                    version,
-                    description: String::new(),
-                    source: PackageSource::Cargo,
-                    ..Default::default()
-                });
-            }
-        }
-        packages
-    }
-}
-
-#[async_trait]
-impl PackageProvider for CargoProvider {
-    async fn search(&self, query: &str) -> Result<Vec<Package>> {
-        let query = query.to_string();
-        tokio::task::spawn_blocking(move || {
-            let output = Command::new("cargo")
-                .args(["search", &query, "--limit", "50"])
-                .output()
-                .map_err(|e| AppError::Cargo(format!("Failed to execute cargo search: {}", e)))?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(AppError::Cargo(format!("cargo search failed: {}", stderr)));
-            }
-
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            Ok(Self::parse_cargo_search(&stdout))
-        })
-        .await
-        .map_err(|e| AppError::Other(format!("Join error: {}", e)))?
-    }
-
-    async fn is_installed(&self, pkg_name: &str) -> bool {
-        let pkg_name = pkg_name.to_string();
-        tokio::task::spawn_blocking(move || {
-            let output = Command::new("cargo").args(["install", "--list"]).output();
-
-            if let Ok(o) = output {
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                for line in stdout.lines() {
-                    if line.starts_with(&format!("{} ", pkg_name)) {
-                        return true;
-                    }
-                }
-            }
-            false
-        })
-        .await
-        .unwrap_or_default()
-    }
-}
-
-/// Pip package provider implementation
-pub struct PipProvider {
-    client: reqwest::Client,
-}
-
-impl Default for PipProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PipProvider {
-    pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .user_agent("metapak/0.1.0")
-            .build()
-            .unwrap_or_else(|e| {
-                tracing::warn!("Failed to create Pip HTTP client: {}, using default", e);
-                reqwest::Client::new()
-            });
-        Self { client }
-    }
-}
-
-#[async_trait]
-impl PackageProvider for PipProvider {
-    async fn search(&self, query: &str) -> Result<Vec<Package>> {
-        // Try exact match via JSON API first since pip search is deprecated
-        let url = format!("https://pypi.org/pypi/{}/json", urlencoding::encode(query));
-
-        let response = self.client.get(&url).send().await;
-
-        match response {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(data) = resp.json::<PypiResponse>().await {
-                    let info = data.info;
-                    return Ok(vec![Package {
-                        name: info.name,
-                        version: info.version,
-                        description: info.summary.unwrap_or_default(),
-                        source: PackageSource::Pip,
-                        url: info.project_url.or(info.home_page),
-                        maintainers: info.author.map(|a| vec![a]).unwrap_or_default(),
-                        licenses: info.license.map(|l| vec![l]).unwrap_or_default(),
-                        ..Default::default()
-                    }]);
-                }
-            }
-            _ => {}
-        }
-
-        Ok(Vec::new())
-    }
-
-    async fn is_installed(&self, pkg_name: &str) -> bool {
-        let pkg_name = pkg_name.to_string();
-        match tokio::task::spawn_blocking(move || {
-            Command::new("pip")
-                .args(["show", &pkg_name])
-                .output()
-                .map(|o| o.status.success())
-        })
-        .await
-        {
-            Ok(Ok(res)) => res,
-            _ => false,
-        }
-    }
-}
-
-/// Update provider implementation
-pub struct SystemUpdateProvider;
-
-impl Default for SystemUpdateProvider {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Update provider implementation that delegates to the system provider
+pub struct SystemUpdateProvider {
+    inner: Arc<dyn UpdateProvider>,
 }
 
 impl SystemUpdateProvider {
-    pub fn new() -> Self {
-        Self
+    pub fn new(inner: Arc<dyn UpdateProvider>) -> Self {
+        Self { inner }
     }
 }
 
 #[async_trait]
 impl UpdateProvider for SystemUpdateProvider {
     async fn check_updates(&self) -> Result<usize> {
-        tokio::task::spawn_blocking(move || {
-            // Try checkupdates first (from pacman-contrib) - doesn't require sudo
-            if let Ok(output) = Command::new("checkupdates").output() {
-                if output.status.success() {
-                    let stdout = String::from_utf8(output.stdout).map_err(|e| {
-                        AppError::Pacman(format!("Invalid UTF-8 in checkupdates output: {}", e))
-                    })?;
-                    return Ok(stdout.lines().filter(|l| !l.is_empty()).count());
-                }
-            }
-
-            // Fallback to pacman -Qu (checks against local DB)
-            let output = Command::new("pacman")
-                .arg("-Qu")
-                .output()
-                .map_err(|e| AppError::Pacman(format!("Failed to execute pacman -Qu: {}", e)))?;
-
-            if output.status.success() {
-                let stdout = String::from_utf8(output.stdout).map_err(|e| {
-                    AppError::Pacman(format!("Invalid UTF-8 in pacman -Qu output: {}", e))
-                })?;
-                return Ok(stdout.lines().filter(|l| !l.is_empty()).count());
-            }
-
-            Ok(0)
-        })
-        .await
-        .map_err(|e| AppError::Other(format!("Join error: {}", e)))?
+        self.inner.check_updates().await
     }
 
     async fn get_outdated_packages(&self) -> Result<Vec<OutdatedPackage>> {
-        tokio::task::spawn_blocking(move || {
-            let mut outdated = Vec::new();
-
-            // Try pacman -Qu first (installed packages with newer versions available)
-            let output = Command::new("pacman")
-                .arg("-Qu")
-                .output()
-                .map_err(|e| AppError::Pacman(format!("Failed to execute pacman -Qu: {}", e)))?;
-
-            if output.status.success() {
-                let stdout = String::from_utf8(output.stdout).map_err(|e| {
-                    AppError::Pacman(format!("Invalid UTF-8 in pacman -Qu output: {}", e))
-                })?;
-
-                for line in stdout.lines().filter(|l| !l.is_empty()) {
-                    let parts: Vec<&str> = line.splitn(3, ' ').collect();
-                    if parts.len() >= 2 {
-                        let name = parts[0].to_string();
-                        let version = parts[1].to_string();
-
-                        let mut pkg = OutdatedPackage::new(
-                            name.clone(),
-                            "?".to_string(),
-                            version,
-                            "unknown".to_string(),
-                        );
-
-                        // Get package info
-                        if let Ok(info) = Command::new("pacman").arg("-Qi").arg(&name).output() {
-                            if info.status.success() {
-                                let info_str = String::from_utf8_lossy(&info.stdout);
-                                for info_line in info_str.lines() {
-                                    if info_line.starts_with("Repository") {
-                                        if let Some(repo) = info_line.split(':').nth(1) {
-                                            pkg.repository = repo.trim().to_string();
-                                            pkg.is_aur = pkg.repository.to_lowercase() == "aur";
-                                        }
-                                    } else if info_line.starts_with("Installed Size") {
-                                        if let Some(size) = info_line.split(':').nth(1) {
-                                            let size_str = size.trim();
-                                            // Parse size like "150.00 MiB"
-                                            let multiplier: u64 = if size_str.contains("GiB") {
-                                                1024 * 1024
-                                            } else if size_str.contains("MiB") {
-                                                1024
-                                            } else {
-                                                1
-                                            };
-                                            let num: f64 = size_str
-                                                .replace("GiB", "")
-                                                .replace("MiB", "")
-                                                .replace("KiB", "")
-                                                .trim()
-                                                .parse()
-                                                .unwrap_or(0.0);
-                                            pkg.download_size = (num * multiplier as f64) as u64;
-                                        }
-                                    } else if info_line.starts_with("Depends On") {
-                                        let deps = info_line.split(':').nth(1).unwrap_or("");
-                                        pkg.new_dependencies = deps
-                                            .split_whitespace()
-                                            .map(|s| s.to_string())
-                                            .collect();
-                                    }
-                                }
-                            }
-                        }
-
-                        outdated.push(pkg);
-                    }
-                }
-            }
-
-            Ok(outdated)
-        })
-        .await
-        .map_err(|e| AppError::Other(format!("Join error: {}", e)))?
+        self.inner.get_outdated_packages().await
     }
 }
 
@@ -864,6 +99,7 @@ pub struct PackageService {
     providers: Vec<Arc<dyn PackageProvider>>,
     update_provider: Arc<dyn UpdateProvider>,
     cache: Arc<SearchCache>,
+    #[allow(dead_code)]
     config: AppConfig,
 }
 
@@ -986,6 +222,9 @@ pub fn plan_package_transaction(packages: &[Package], config: &AppConfig) -> Vec
                 args.extend(names);
                 commands.push(CommandSpec::new_no_sudo("pip", args));
             }
+            _ => {
+                // Implementation for other sources
+            }
         }
     }
 
@@ -1019,6 +258,24 @@ pub fn plan_package_transaction(packages: &[Package], config: &AppConfig) -> Vec
                 let mut args = vec!["install".to_string(), "--user".to_string()];
                 args.extend(names);
                 commands.push(CommandSpec::new_no_sudo("pip", args));
+            }
+            PackageSource::Apt => {
+                 let mut args = vec!["apt-get".to_string(), "install".to_string(), "-y".to_string()];
+                 args.extend(names);
+                 commands.push(CommandSpec::new("sudo", args));
+            }
+            PackageSource::Brew => {
+                 let mut args = vec!["install".to_string()];
+                 args.extend(names);
+                 commands.push(CommandSpec::new_no_sudo("brew", args));
+            }
+            PackageSource::Scoop => {
+                 let mut args = vec!["install".to_string()];
+                 args.extend(names);
+                 commands.push(CommandSpec::new_no_sudo("scoop", args));
+            }
+            _ => {
+                // Implementation for other sources
             }
         }
     }
@@ -1054,15 +311,67 @@ static SEARCH_CACHE: Lazy<Arc<SearchCache>> = Lazy::new(|| Arc::new(SearchCache:
 
 impl PackageService {
     pub fn new(config: AppConfig) -> Self {
+        let mut providers: Vec<Arc<dyn PackageProvider>> = Vec::new();
+        
+        // Detect system providers
+        use crate::platform::{detect_package_managers, PackageManager};
+        let managers = detect_package_managers();
+        
+        let mut update_provider: Option<Arc<dyn UpdateProvider>> = None;
+
+        for manager in managers {
+            match manager {
+                PackageManager::Pacman => {
+                    let p = Arc::new(PacmanProvider::new());
+                    providers.push(p.clone());
+                    providers.push(Arc::new(AurProvider::new()));
+                    if update_provider.is_none() { update_provider = Some(p); }
+                }
+                PackageManager::Apt => {
+                    let p = Arc::new(AptProvider::new());
+                    providers.push(p.clone());
+                    if update_provider.is_none() { update_provider = Some(p); }
+                }
+                PackageManager::Brew => {
+                    let p = Arc::new(BrewProvider::new());
+                    providers.push(p.clone());
+                    if update_provider.is_none() { update_provider = Some(p); }
+                }
+                PackageManager::Scoop => {
+                    let p = Arc::new(ScoopProvider::new());
+                    providers.push(p.clone());
+                    if update_provider.is_none() { update_provider = Some(p); }
+                }
+                PackageManager::Dnf => {
+                    let p = Arc::new(DnfProvider::new());
+                    providers.push(p.clone());
+                    if update_provider.is_none() { update_provider = Some(p); }
+                }
+                PackageManager::Zypper => {
+                    let p = Arc::new(ZypperProvider::new());
+                    providers.push(p.clone());
+                    if update_provider.is_none() { update_provider = Some(p); }
+                }
+                PackageManager::Apk => {
+                    let p = Arc::new(ApkProvider::new());
+                    providers.push(p.clone());
+                    if update_provider.is_none() { update_provider = Some(p); }
+                }
+                _ => {}
+            }
+        }
+
+        // Ecosystem providers (always added)
+        providers.push(Arc::new(NpmProvider::new()));
+        providers.push(Arc::new(CargoProvider::new()));
+        providers.push(Arc::new(PipProvider::new()));
+
+        // Fallback update provider if none detected
+        let update_provider = update_provider.unwrap_or_else(|| Arc::new(PacmanProvider::new()));
+
         Self {
-            providers: vec![
-                Arc::new(PacmanProvider::new()),
-                Arc::new(AurProvider::new()),
-                Arc::new(NpmProvider::new()),
-                Arc::new(CargoProvider::new()),
-                Arc::new(PipProvider::new()),
-            ],
-            update_provider: Arc::new(SystemUpdateProvider::new()),
+            providers,
+            update_provider,
             cache: Arc::clone(&SEARCH_CACHE),
             config,
         }
@@ -1126,13 +435,7 @@ impl PackageService {
         // Deduplicate by source+name and keep richer entries if duplicates exist.
         let mut deduped: HashMap<(String, String), Package> = HashMap::new();
         for pkg in all_results {
-            let source = match pkg.source {
-                PackageSource::Pacman => "pacman".to_string(),
-                PackageSource::Aur => "aur".to_string(),
-                PackageSource::Npm => "npm".to_string(),
-                PackageSource::Cargo => "cargo".to_string(),
-                PackageSource::Pip => "pip".to_string(),
-            };
+            let source = pkg.source.to_string();
             let key = (source, pkg.name.clone());
             deduped
                 .entry(key)
@@ -1376,7 +679,7 @@ impl PackageService {
         let html = String::from_utf8_lossy(&output.stdout);
         let mut versions = Vec::new();
 
-        let re = regex::Regex::new(r#"href="(\d{4}/\d{2}/\d{2})/([^"]+/)""#).unwrap();
+        let re = Regex::new(r#"href="(\d{4}/\d{2}/\d{2})/([^"]+/)""#).unwrap();
         for cap in re.captures_iter(&html) {
             if let (Some(date), Some(ver)) = (cap.get(1), cap.get(2)) {
                 let version = ver.as_str().trim_end_matches('/').to_string();
@@ -1419,112 +722,6 @@ impl Default for PackageService {
     fn default() -> Self {
         Self::new(AppConfig::default())
     }
-}
-
-// AUR Response structures
-#[derive(serde::Deserialize, Debug)]
-struct AurResponse {
-    #[serde(rename = "resultcount")]
-    _result_count: u32,
-    results: Vec<AurPackage>,
-}
-
-#[derive(serde::Deserialize, Debug)]
-struct AurPackage {
-    #[serde(rename = "Name")]
-    name: String,
-    #[serde(rename = "Version")]
-    version: String,
-    #[serde(rename = "Description")]
-    description: Option<String>,
-    #[serde(rename = "URL")]
-    url: Option<String>,
-    #[serde(rename = "Maintainer")]
-    maintainer: Option<String>,
-    #[serde(rename = "Depends")]
-    depends: Option<Vec<String>>,
-    #[serde(rename = "MakeDepends")]
-    make_depends: Option<Vec<String>>,
-    #[serde(rename = "OptDepends")]
-    opt_depends: Option<Vec<String>>,
-    #[serde(rename = "Conflicts")]
-    conflicts: Option<Vec<String>>,
-    #[serde(rename = "License")]
-    licenses: Option<Vec<String>>,
-    #[serde(rename = "Keywords")]
-    keywords: Option<Vec<String>>,
-    #[serde(rename = "Provides")]
-    provides: Option<Vec<String>>,
-    #[serde(rename = "NumVotes")]
-    num_votes: Option<i32>,
-    #[serde(rename = "Popularity")]
-    popularity: Option<f32>,
-    #[serde(rename = "LastUpdated")]
-    last_updated: Option<i64>,
-    #[serde(rename = "FirstSubmitted")]
-    first_submitted: Option<i64>,
-    #[serde(rename = "OutOfDate")]
-    out_of_date: Option<i64>,
-    #[serde(rename = "PackageBaseID")]
-    package_base_id: Option<i32>,
-    #[serde(rename = "PackageBase")]
-    #[allow(dead_code)]
-    package_base: Option<String>,
-    #[serde(rename = "Download")]
-    #[allow(dead_code)]
-    download: Option<String>,
-    #[serde(rename = "FileSize")]
-    #[allow(dead_code)]
-    file_size: Option<i64>,
-}
-
-// NPM Response structures
-#[derive(serde::Deserialize, Debug)]
-struct NpmResponse {
-    objects: Vec<NpmResult>,
-}
-
-#[derive(serde::Deserialize, Debug)]
-struct NpmResult {
-    package: NpmPackage,
-}
-
-#[derive(serde::Deserialize, Debug)]
-struct NpmPackage {
-    name: String,
-    version: String,
-    description: Option<String>,
-    keywords: Option<Vec<String>>,
-    links: Option<NpmLinks>,
-    publisher: Option<NpmUser>,
-    maintainers: Option<Vec<NpmUser>>,
-    license: Option<String>,
-}
-
-#[derive(serde::Deserialize, Debug)]
-struct NpmLinks {
-    npm: Option<String>,
-}
-
-#[derive(serde::Deserialize, Debug)]
-struct NpmUser {
-    username: Option<String>,
-}
-
-#[derive(serde::Deserialize, Debug)]
-struct PypiResponse {
-    info: PypiInfo,
-}
-
-#[derive(serde::Deserialize, Debug)]
-struct PypiInfo {
-    name: String,
-    version: String,
-    summary: Option<String>,
-    home_page: Option<String>,
-    project_url: Option<String>,
-    author: Option<String>,
-    license: Option<String>,
 }
 
 /// Command builder for safe command execution
@@ -1651,11 +848,23 @@ impl AurHelperCommand {
     }
 
     fn command_exists(cmd: &str) -> bool {
-        Command::new("which")
-            .arg(cmd)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        #[cfg(target_os = "windows")]
+        {
+            Command::new("where")
+                .arg(cmd)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            Command::new("which")
+                .arg(cmd)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
     }
 
     /// Build install command
@@ -1814,7 +1023,7 @@ mod tests {
         let header = "core/linux 6.6.1-arch1 (base) [installed]";
         let desc = "The Linux kernel and modules";
 
-        let pkg = PacmanProvider::parse_entry(header, desc);
+        let pkg = PacmanProvider::parse_entry_for_test(header, desc);
         assert!(pkg.is_some());
 
         let pkg = pkg.unwrap();
@@ -1828,7 +1037,7 @@ mod tests {
         let header = "community/firefox 120.0-1";
         let desc = "Standalone web browser";
 
-        let pkg = PacmanProvider::parse_entry(header, desc);
+        let pkg = PacmanProvider::parse_entry_for_test(header, desc);
         assert!(pkg.is_some());
         assert!(!pkg.unwrap().is_installed);
     }
@@ -1977,89 +1186,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_npm_response() {
-        let json = r#"{
-            "objects": [
-                {
-                    "package": {
-                        "name": "express",
-                        "version": "5.2.1",
-                        "description": "Fast web framework",
-                        "keywords": ["web", "framework"],
-                        "links": {
-                            "npm": "https://www.npmjs.com/package/express"
-                        },
-                        "publisher": {
-                            "username": "jonchurch"
-                        },
-                        "license": "MIT"
-                    }
-                }
-            ]
-        }"#;
-
-        let response: NpmResponse = serde_json::from_str(json).unwrap();
-        let packages = NpmProvider::parse_npm_response(response);
-
-        assert_eq!(packages.len(), 1);
-        let pkg = &packages[0];
-        assert_eq!(pkg.name, "express");
-        assert_eq!(pkg.version, "5.2.1");
-        assert_eq!(pkg.description, "Fast web framework");
-        assert_eq!(pkg.source, PackageSource::Npm);
-        assert!(pkg.keywords.contains(&"web".to_string()));
-        assert!(pkg.maintainers.contains(&"jonchurch".to_string()));
-        assert_eq!(pkg.licenses, vec!["MIT".to_string()]);
-        assert_eq!(
-            pkg.url,
-            Some("https://www.npmjs.com/package/express".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_cargo_search() {
-        let stdout = r#"
-cargo-edit = "0.12.2" # A utility for managing cargo dependencies from the command line.
-tokio = "1.36.0" # An event-driven, non-blocking I/O platform for writing asynchronous applications with the Rust programming language.
-...
-"#;
-        let packages = CargoProvider::parse_cargo_search(stdout);
-        assert_eq!(packages.len(), 2);
-
-        assert_eq!(packages[0].name, "cargo-edit");
-        assert_eq!(packages[0].version, "0.12.2");
-        assert_eq!(packages[0].source, PackageSource::Cargo);
-        assert!(packages[0]
-            .description
-            .contains("managing cargo dependencies"));
-
-        assert_eq!(packages[1].name, "tokio");
-        assert_eq!(packages[1].version, "1.36.0");
-        assert!(packages[1].description.contains("event-driven"));
-    }
-
-    #[test]
-    fn test_parse_pypi_response() {
-        let json = r#"{
-            "info": {
-                "name": "requests",
-                "version": "2.31.0",
-                "summary": "Python HTTP for Humans.",
-                "project_url": "https://pypi.org/project/requests/",
-                "author": "Kenneth Reitz",
-                "license": "Apache 2.0"
-            }
-        }"#;
-        let response: PypiResponse = serde_json::from_str(json).unwrap();
-        let info = response.info;
-        assert_eq!(info.name, "requests");
-        assert_eq!(info.version, "2.31.0");
-        assert_eq!(info.summary, Some("Python HTTP for Humans.".to_string()));
-        assert_eq!(info.author, Some("Kenneth Reitz".to_string()));
-        assert_eq!(info.license, Some("Apache 2.0".to_string()));
-    }
-
-    #[test]
     fn test_plan_package_transaction_ecosystems() {
         let config = AppConfig::default();
 
@@ -2110,5 +1236,13 @@ tokio = "1.36.0" # An event-driven, non-blocking I/O platform for writing asynch
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].prog, "npm");
         assert_eq!(cmds[0].args, vec!["uninstall", "-g", "express"]);
+    }
+}
+
+// Add a test-only helper to PacmanProvider for unit tests
+#[cfg(test)]
+impl PacmanProvider {
+    pub fn parse_entry_for_test(header: &str, desc: &str) -> Option<Package> {
+        Self::parse_entry(header, desc)
     }
 }
