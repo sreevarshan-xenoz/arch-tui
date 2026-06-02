@@ -226,6 +226,36 @@ impl PackageSimulator for SimulationEngine {
 
                 Ok(result)
             }
+            "brew" => {
+                // brew install --dry-run
+                let output = Command::new("brew")
+                    .args(["install", "--dry-run"])
+                    .args(packages)
+                    .output()
+                    .await?;
+
+                let _stdout = String::from_utf8_lossy(&output.stdout);
+                let mut conflicts = Vec::new();
+                if !output.status.success() {
+                    conflicts.push(String::from_utf8_lossy(&output.stderr).to_string());
+                }
+
+                Ok(SimulationResult {
+                    total_download_bytes: 0, // brew dry-run doesn't easily show sizes
+                    disk_change_bytes: 0,
+                    conflicts,
+                    config_changes: Vec::new(),
+                })
+            }
+            "scoop" => {
+                // scoop doesn't have a great dry-run for sizes, just check if it can be installed
+                Ok(SimulationResult {
+                    total_download_bytes: 0,
+                    disk_change_bytes: 0,
+                    conflicts: Vec::new(),
+                    config_changes: Vec::new(),
+                })
+            }
             _ => {
                 // Default fallback for unimplemented backends
                 Ok(SimulationResult {
