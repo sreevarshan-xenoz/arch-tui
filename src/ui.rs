@@ -290,6 +290,12 @@ fn render_results_list(app: &App, f: &mut Frame, area: Rect, theme: &crate::them
                     crate::models::PackageSource::Npm => theme.warning(),
                     crate::models::PackageSource::Cargo => theme.secondary(),
                     crate::models::PackageSource::Pip => theme.info(),
+                    crate::models::PackageSource::Apt 
+                    | crate::models::PackageSource::Brew 
+                    | crate::models::PackageSource::Scoop
+                    | crate::models::PackageSource::Dnf
+                    | crate::models::PackageSource::Zypper
+                    | crate::models::PackageSource::Apk => theme.primary(),
                 }
             };
 
@@ -314,6 +320,12 @@ fn render_results_list(app: &App, f: &mut Frame, area: Rect, theme: &crate::them
                 crate::models::PackageSource::Npm => "npm  ",
                 crate::models::PackageSource::Cargo => "crgo ",
                 crate::models::PackageSource::Pip => "pip  ",
+                crate::models::PackageSource::Apt => "apt  ",
+                crate::models::PackageSource::Brew => "brew ",
+                crate::models::PackageSource::Scoop => "scop ",
+                crate::models::PackageSource::Dnf => "dnf  ",
+                crate::models::PackageSource::Zypper => "zyp  ",
+                crate::models::PackageSource::Apk => "apk  ",
             };
 
             let size_str = pkg.format_download_size();
