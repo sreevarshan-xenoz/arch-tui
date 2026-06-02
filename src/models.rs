@@ -57,6 +57,12 @@ pub struct Package {
 pub enum PackageSource {
     Pacman,
     Aur,
+    Apt,
+    Brew,
+    Scoop,
+    Dnf,
+    Zypper,
+    Apk,
     /// NPM (Node.js package registry)
     Npm,
     /// Cargo (Rust package registry)
@@ -70,6 +76,12 @@ impl std::fmt::Display for PackageSource {
         match self {
             PackageSource::Pacman => write!(f, "pacman"),
             PackageSource::Aur => write!(f, "aur"),
+            PackageSource::Apt => write!(f, "apt"),
+            PackageSource::Brew => write!(f, "brew"),
+            PackageSource::Scoop => write!(f, "scoop"),
+            PackageSource::Dnf => write!(f, "dnf"),
+            PackageSource::Zypper => write!(f, "zypper"),
+            PackageSource::Apk => write!(f, "apk"),
             PackageSource::Npm => write!(f, "npm"),
             PackageSource::Cargo => write!(f, "cargo"),
             PackageSource::Pip => write!(f, "pip"),
