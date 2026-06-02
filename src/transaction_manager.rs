@@ -146,15 +146,24 @@ impl TransactionManager {
         // 2. Simulation
         if let Some(cmds) = commands {
             tracing::info!("Running pre-transaction simulation...");
-            // Extract package names from commands like "sudo pacman -S pkg1 pkg2"
+            // Extract package names from commands
             let mut packages = Vec::new();
             for cmd in cmds {
-                if cmd.prog.contains("pacman") || cmd.prog == "sudo" {
-                    // Very simple heuristic: anything that doesn't start with - is a package
+                let prog = cmd.prog.to_lowercase();
+                if prog.contains("pacman") || prog == "sudo" || prog == "brew" || prog == "scoop" || prog == "apt-get" || prog == "apt" {
+                    // Heuristic: anything that doesn't start with - is a package
+                    // Skip keywords/flags
                     for arg in &cmd.args {
                         if !arg.starts_with('-')
                             && arg != "pacman"
                             && arg != "sudo"
+                            && arg != "brew"
+                            && arg != "scoop"
+                            && arg != "apt-get"
+                            && arg != "apt"
+                            && arg != "install"
+                            && arg != "remove"
+                            && arg != "uninstall"
                             && arg != "-S"
                             && arg != "-R"
                             && arg != "-U"
