@@ -14,8 +14,8 @@ The project follows a modular architecture designed for extensibility and safety
 
 - **`src/main.rs`**: Entry point. Sets up the terminal, initializes the application state, spawns background tasks for async actions, and manages the main event loop.
 - **`src/app.rs`**: Contains the `App` struct, which holds the entire application state (results, selection, loading state, history, etc.).
-- **`src/backends/`**: Implements the `UniversalPackageManager` trait for different package managers (`pacman`, `apt`, `brew`, `apk`, `scoop`, `npm`, `pip`, etc.) and snapshot providers (`btrfs`).
-- **`src/transaction_manager.rs`**: Orchestrates safe system modifications, handling pre-operation snapshots and potential rollbacks.
+- **`src/backends/`**: Implements the `PackageProvider` and `UpdateProvider` traits for different package managers (`pacman`, `apt`, `brew`, `apk`, `scoop`, `npm`, `pip`, etc.) under the `providers/` subdirectory. Also contains snapshot providers (`btrfs`, `timeshift`).
+- **`src/diagnostics.rs`**: Gathers system health and hardware information using the `sysinfo` crate for cross-platform compatibility.
 - **`src/ui.rs`**: Modularized UI components using Ratatui.
 - **`src/action.rs` & `src/models.rs`**: Define the internal message passing (Actions) and data structures (Packages).
 

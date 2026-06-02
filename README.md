@@ -324,20 +324,18 @@ Visualizes package dependencies as an interactive tree. Select a package to see 
 Use the startup password prompt to cache your sudo credentials for the session. If you dismiss it, you'll be prompted during operations. On systems without sudo (e.g., some containers), run metapak as root.
 
 ### "Search returns no results"
-- Ensure at least one supported package manager is installed
+- Ensure at least one supported package manager is installed and in your PATH
 - Check that the package name is correct (typos tolerated — fuzzy matching is enabled)
-- Check network connectivity if searching AUR
+- Check network connectivity for online providers (AUR, NPM, Cargo, PyPI)
 
 ### "AUR helper not detected"
-metapak auto-detects `yay` and `paru`. Set `aur_helper = "yay"` explicitly in `config.toml` if auto-detection fails.
+metapak auto-detects `yay` and `paru`. Set `aur_helper = "yay"` explicitly in `config.toml` if auto-detection fails. This only applies to Arch Linux systems.
 
-### "Operation hangs or is slow"
-- Large repository updates (especially `apt update`) can take time
-- The search debounce (300ms by default) adds a small delay before executing queries
-- Check `[ui] search_debounce_ms` in config to tune responsiveness
+### "macOS: brew commands fail"
+Ensure Homebrew is installed and `brew` is available in your shell environment. metapak uses the standard `brew` binary.
 
 ### "Windows: scoop commands fail"
-Ensure Scoop is installed and in your PATH. Run `scoop help` in PowerShell to verify.
+Ensure Scoop is installed and in your PATH. metapak expects `scoop` to be accessible via standard command execution.
 
 ### "Error: database locked"
 Another package manager instance (e.g., `apt`, `pacman`) is running. Close it and retry.
@@ -357,7 +355,8 @@ src/
 ├── services.rs          # Package service layer (search, install, remove)
 ├── backends/
 │   ├── mod.rs
-│   └── snapshots/       # Snapshot providers (btrfs, timeshift)
+│   ├── snapshots/       # Snapshot providers (btrfs, timeshift)
+│   └── providers/       # Modular package providers (pacman, brew, scoop, etc.)
 ├── config.rs            # Configuration loading from TOML
 ├── search.rs            # Fuzzy search with query syntax
 ├── traits.rs            # PackageProvider, PackageSimulator traits
