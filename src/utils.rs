@@ -5,6 +5,83 @@
 use secrecy::{ExposeSecret, SecretString};
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Circuit breaker for external API calls to prevent flooding when service is down
+pub struct CircuitBreaker {
+    failure_count: AtomicU32,
+    last_failure: AtomicU64,
+    state: AtomicU32,
+}
+
+impl CircuitBreaker {
+    pub const FAILURE_THRESHOLD: u32 = 5;
+    pub const RECOVERY_SECS: u64 = 30;
+    pub const STATE_CLOSED: u32 = 0;
+    pub const STATE_OPEN: u32 = 1;
+    pub const STATE_HALF_OPEN: u32 = 2;
+
+    pub fn new() -> Self {
+        Self {
+            failure_count: AtomicU32::new(0),
+            last_failure: AtomicU64::new(0),
+            state: AtomicU32::new(Self::STATE_CLOSED),
+        }
+    }
+
+    pub fn is_available(&self) -> bool {
+        let state = self.state.load(Ordering::SeqCst);
+        match state {
+            Self::STATE_CLOSED => true,
+            Self::STATE_OPEN => {
+                let last_fail = self.last_failure.load(Ordering::SeqCst);
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let elapsed = now.saturating_sub(last_fail);
+                
+                if elapsed > Self::RECOVERY_SECS {
+                    self.state.store(Self::STATE_HALF_OPEN, Ordering::SeqCst);
+                    true
+                } else {
+                    false
+                }
+            }
+            Self::STATE_HALF_OPEN => true,
+            _ => false,
+        }
+    }
+
+    pub fn record_success(&self) {
+        self.failure_count.store(0, Ordering::SeqCst);
+        self.state.store(Self::STATE_CLOSED, Ordering::SeqCst);
+    }
+
+    pub fn record_failure(&self) {
+        let count = self.failure_count.fetch_add(1, Ordering::SeqCst) + 1;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.last_failure.store(now, Ordering::SeqCst);
+
+        if count >= Self::FAILURE_THRESHOLD {
+            self.state.store(Self::STATE_OPEN, Ordering::SeqCst);
+            tracing::warn!(
+                "Circuit breaker opened due to {} consecutive failures",
+                count
+            );
+        }
+    }
+}
+
+impl Default for CircuitBreaker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Securely verify sudo password
 pub fn check_sudo_password(password: &SecretString) -> bool {
