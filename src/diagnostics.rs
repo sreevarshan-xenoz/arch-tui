@@ -1,10 +1,10 @@
 //! System diagnostics collection.
 //!
 //! Gathers system health information: package manager status, disk usage,
-//! AUR helper availability, database lock status, and other diagnostics.
+//! availability, and other diagnostics using sysinfo for cross-platform support.
 
-use std::fs;
 use std::process::Command;
+use sysinfo::{System, Disks};
 
 #[derive(Debug, Clone)]
 pub struct DiagnosticItem {
@@ -13,246 +13,174 @@ pub struct DiagnosticItem {
 }
 
 pub fn run_diagnostics() -> Vec<DiagnosticItem> {
-    let aur_helper = if command_exists("paru") {
-        "paru"
-    } else if command_exists("yay") {
-        "yay"
-    } else {
-        "none"
-    };
+    let mut items = Vec::new();
+    
+    // Package manager status
+    if command_exists("pacman") {
+        let aur_helper = if command_exists("paru") {
+            "paru"
+        } else if command_exists("yay") {
+            "yay"
+        } else {
+            "none"
+        };
 
-    let items = vec![
-        DiagnosticItem {
+        items.push(DiagnosticItem {
             label: "pacman binary".to_string(),
-            status: if command_exists("pacman") {
-                "OK".to_string()
-            } else {
-                "MISSING".to_string()
-            },
-        },
-        DiagnosticItem {
+            status: "OK".to_string(),
+        });
+        items.push(DiagnosticItem {
             label: "AUR helper".to_string(),
             status: aur_helper.to_string(),
-        },
-        DiagnosticItem {
+        });
+        items.push(DiagnosticItem {
             label: "pacman db lock".to_string(),
             status: if std::path::Path::new("/var/lib/pacman/db.lck").exists() {
                 "LOCKED".to_string()
             } else {
                 "clear".to_string()
             },
-        },
-        DiagnosticItem {
-            label: "disk space /".to_string(),
-            status: disk_usage_root().unwrap_or_else(|| "unknown".to_string()),
-        },
-    ];
+        });
+    } else if command_exists("brew") {
+        items.push(DiagnosticItem {
+            label: "brew binary".to_string(),
+            status: "OK".to_string(),
+        });
+    } else if command_exists("scoop") {
+        items.push(DiagnosticItem {
+            label: "scoop binary".to_string(),
+            status: "OK".to_string(),
+        });
+    } else if command_exists("apt") {
+        items.push(DiagnosticItem {
+            label: "apt binary".to_string(),
+            status: "OK".to_string(),
+        });
+    }
+
+    // Disk space (Root or C:)
+    let disks = Disks::new_with_refreshed_list();
+    let root_disk = if cfg!(target_os = "windows") {
+        disks.iter().find(|d| d.mount_point().to_str() == Some("C:\\"))
+    } else {
+        disks.iter().find(|d| d.mount_point().to_str() == Some("/"))
+    };
+
+    if let Some(disk) = root_disk {
+        let used = disk.total_space() - disk.available_space();
+        let usage_pct = (used as f64 / disk.total_space() as f64) * 100.0;
+        items.push(DiagnosticItem {
+            label: "disk usage".to_string(),
+            status: format!("{:.1}% used", usage_pct),
+        });
+    }
+
     items
 }
 
 pub fn get_system_info() -> Vec<DiagnosticItem> {
+    let mut sys = System::new_all();
+    sys.refresh_all();
+
     let mut items = vec![
         DiagnosticItem {
             label: "OS".to_string(),
-            status: get_os_info().unwrap_or_else(|| "unknown".to_string()),
+            status: System::name().unwrap_or_else(|| "unknown".to_string()),
+        },
+        DiagnosticItem {
+            label: "OS Version".to_string(),
+            status: System::os_version().unwrap_or_else(|| "unknown".to_string()),
         },
         DiagnosticItem {
             label: "Kernel".to_string(),
-            status: get_kernel_version().unwrap_or_else(|| "unknown".to_string()),
+            status: System::kernel_version().unwrap_or_else(|| "unknown".to_string()),
         },
         DiagnosticItem {
             label: "Hostname".to_string(),
-            status: get_hostname().unwrap_or_else(|| "unknown".to_string()),
+            status: System::host_name().unwrap_or_else(|| "unknown".to_string()),
         },
         DiagnosticItem {
             label: "Uptime".to_string(),
-            status: get_uptime().unwrap_or_else(|| "unknown".to_string()),
+            status: format_uptime(System::uptime()),
         },
         DiagnosticItem {
             label: "CPU".to_string(),
-            status: get_cpu_info().unwrap_or_else(|| "unknown".to_string()),
+            status: sys.cpus().first().map(|c| c.brand().to_string()).unwrap_or_else(|| "unknown".to_string()),
         },
         DiagnosticItem {
             label: "CPU Cores".to_string(),
-            status: get_cpu_cores().to_string(),
+            status: sys.cpus().len().to_string(),
         },
         DiagnosticItem {
             label: "Memory".to_string(),
-            status: get_memory_info().unwrap_or_else(|| "unknown".to_string()),
-        },
-        DiagnosticItem {
-            label: "Installed packages".to_string(),
-            status: get_total_packages().unwrap_or_else(|_| "unknown".to_string()),
+            status: format!(
+                "{:.1}GB / {:.1}GB used",
+                (sys.used_memory() as f64 / 1024.0 / 1024.0 / 1024.0),
+                (sys.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0)
+            ),
         },
     ];
 
-    // Screen resolution (if available)
-    if let Some(res) = get_screen_resolution() {
-        items.push(DiagnosticItem {
-            label: "Screen".to_string(),
-            status: res,
-        });
+    // Installed packages count
+    if command_exists("pacman") {
+        if let Ok(count) = get_total_packages_pacman() {
+            items.push(DiagnosticItem {
+                label: "Installed packages".to_string(),
+                status: count,
+            });
+        }
+    } else if command_exists("brew") {
+        if let Ok(count) = get_total_packages_brew() {
+            items.push(DiagnosticItem {
+                label: "Brew packages".to_string(),
+                status: count,
+            });
+        }
     }
-
-    // DE/WM
-    items.push(DiagnosticItem {
-        label: "Desktop".to_string(),
-        status: get_desktop_environment().unwrap_or_else(|| "none".to_string()),
-    });
 
     items
 }
 
+fn format_uptime(seconds: u64) -> String {
+    let days = seconds / 86400;
+    let hours = (seconds % 86400) / 3600;
+    let minutes = (seconds % 3600) / 60;
+    if days > 0 {
+        format!("{}d {}h {}m", days, hours, minutes)
+    } else {
+        format!("{}h {}m", hours, minutes)
+    }
+}
+
 fn command_exists(cmd: &str) -> bool {
-    Command::new("which")
-        .arg(cmd)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("where")
+            .arg(cmd)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new("which")
+            .arg(cmd)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
 }
 
-fn disk_usage_root() -> Option<String> {
-    let output = Command::new("df").arg("-h").arg("/").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    let line = stdout.lines().nth(1)?;
-    let cols: Vec<&str> = line.split_whitespace().collect();
-    if cols.len() < 5 {
-        return None;
-    }
-    Some(format!("{} used", cols[4]))
-}
-
-fn get_os_info() -> Option<String> {
-    let content = fs::read_to_string("/etc/os-release").ok()?;
-    for line in content.lines() {
-        if line.starts_with("PRETTY_NAME=") {
-            return Some(
-                line.trim_start_matches("PRETTY_NAME=")
-                    .trim_matches('"')
-                    .to_string(),
-            );
-        }
-    }
-    Some("Arch Linux".to_string())
-}
-
-fn get_kernel_version() -> Option<String> {
-    let output = Command::new("uname").arg("-r").output().ok()?;
-    if output.status.success() {
-        return Some(String::from_utf8(output.stdout).ok()?.trim().to_string());
-    }
-    None
-}
-
-fn get_hostname() -> Option<String> {
-    let output = Command::new("hostname").output().ok()?;
-    if output.status.success() {
-        return Some(String::from_utf8(output.stdout).ok()?.trim().to_string());
-    }
-    None
-}
-
-fn get_uptime() -> Option<String> {
-    let output = Command::new("uptime").arg("-p").output().ok()?;
-    if output.status.success() {
-        return Some(String::from_utf8(output.stdout).ok()?.trim().to_string());
-    }
-    // Fallback to seconds
-    let content = fs::read_to_string("/proc/uptime").ok()?;
-    let parts: Vec<&str> = content.split_whitespace().collect();
-    if let Some(secs) = parts.first() {
-        let total_secs: u64 = secs.parse().ok()?;
-        let days = total_secs / 86400;
-        let hours = (total_secs % 86400) / 3600;
-        let minutes = (total_secs % 3600) / 60;
-        return Some(format!("{}d {}h {}m", days, hours, minutes));
-    }
-    None
-}
-
-fn get_cpu_info() -> Option<String> {
-    let output = Command::new("cat").arg("/proc/cpuinfo").output().ok()?;
-    let content = String::from_utf8(output.stdout).ok()?;
-    for line in content.lines() {
-        if line.starts_with("model name") {
-            let info = line.split(':').nth(1)?.trim().to_string();
-            // Truncate long CPU names
-            if info.len() > 40 {
-                return Some(format!("{}...", &info[..40]));
-            }
-            return Some(info);
-        }
-    }
-    None
-}
-
-fn get_cpu_cores() -> usize {
-    std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(1)
-}
-
-fn get_memory_info() -> Option<String> {
-    let content = fs::read_to_string("/proc/meminfo").ok()?;
-    let mut total = 0u64;
-    let mut available = 0u64;
-
-    for line in content.lines() {
-        if line.starts_with("MemTotal:") {
-            total = parse_meminfo_value(line)?;
-        } else if line.starts_with("MemAvailable:") {
-            available = parse_meminfo_value(line)?;
-        }
-    }
-
-    if total > 0 {
-        let used = total - available;
-        let used_gb = used as f64 / 1024.0 / 1024.0;
-        let total_gb = total as f64 / 1024.0 / 1024.0;
-        return Some(format!("{:.1}GB / {:.1}GB used", used_gb, total_gb));
-    }
-    None
-}
-
-fn parse_meminfo_value(line: &str) -> Option<u64> {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    parts.get(1)?.parse().ok()
-}
-
-fn get_total_packages() -> Result<String, std::io::Error> {
+fn get_total_packages_pacman() -> Result<String, std::io::Error> {
     let output = Command::new("pacman").arg("-Qq").output()?;
     let count = String::from_utf8_lossy(&output.stdout).lines().count();
     Ok(count.to_string())
 }
 
-fn get_screen_resolution() -> Option<String> {
-    let output = Command::new("xrandr").arg("--current").output().ok()?;
-    let content = String::from_utf8(output.stdout).ok()?;
-    for line in content.lines() {
-        if line.contains("*") {
-            let res = line.split_whitespace().next()?;
-            return Some(res.to_string());
-        }
-    }
-    None
-}
-
-fn get_desktop_environment() -> Option<String> {
-    // Check various environment variables
-    if let Ok(de) = std::env::var("XDG_CURRENT_DESKTOP") {
-        if !de.is_empty() {
-            return Some(de);
-        }
-    }
-    if let Ok(de) = std::env::var("DESKTOP_SESSION") {
-        if !de.is_empty() {
-            return Some(de);
-        }
-    }
-    None
+fn get_total_packages_brew() -> Result<String, std::io::Error> {
+    let output = Command::new("brew").arg("list").output()?;
+    let count = String::from_utf8_lossy(&output.stdout).lines().count();
+    Ok(count.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -261,9 +189,11 @@ pub struct OrphanPackage {
 }
 
 pub fn find_orphan_packages() -> Vec<OrphanPackage> {
-    let mut orphans = Vec::new();
+    if !command_exists("pacman") {
+        return Vec::new();
+    }
 
-    // Get all explicitly installed packages
+    let mut orphans = Vec::new();
     let explicit_output = Command::new("pacman")
         .args(["-Qet", "--color", "never"])
         .output();
@@ -274,46 +204,14 @@ pub fn find_orphan_packages() -> Vec<OrphanPackage> {
             for line in packages.lines() {
                 let pkg_name = line.split_whitespace().next().unwrap_or("");
                 if !pkg_name.is_empty() {
-                    // Check if this package is a dependency of another package
-                    if !is_required_by_other_package(pkg_name) {
-                        orphans.push(OrphanPackage {
-                            name: pkg_name.to_string(),
-                        });
-                    }
+                    orphans.push(OrphanPackage {
+                        name: pkg_name.to_string(),
+                    });
                 }
             }
         }
     }
-
     orphans
-}
-
-fn is_required_by_other_package(pkg_name: &str) -> bool {
-    // Check if any package depends on this one
-    let output = Command::new("pacman").args(["-Q", pkg_name]).output();
-
-    if let Ok(output) = output {
-        if output.status.success() {
-            // pacman -Q shows the package info including dependencies
-            // If it says "optional dependencies" it might still be needed
-            // But we keep it simple - if explicitly installed, check reverse deps
-        }
-    }
-
-    // Check reverse dependencies using pacman -Sii
-    let output = Command::new("pacman").args(["-Sii", pkg_name]).output();
-
-    if let Ok(output) = output {
-        let info = String::from_utf8_lossy(&output.stdout);
-        for line in info.lines() {
-            if line.contains("Required By") {
-                let deps = line.split(':').nth(1).unwrap_or("").trim();
-                return !deps.is_empty() && deps != "None";
-            }
-        }
-    }
-
-    false
 }
 
 #[derive(Debug, Clone)]
@@ -324,8 +222,11 @@ pub struct PackageSize {
 }
 
 pub fn get_package_sizes() -> Vec<PackageSize> {
-    let mut packages = Vec::new();
+    if !command_exists("pacman") {
+        return Vec::new();
+    }
 
+    let mut packages = Vec::new();
     let output = Command::new("pacman")
         .args(["-Qi", "--color", "never"])
         .output();
@@ -384,14 +285,14 @@ pub struct CacheInfo {
 pub fn get_cache_info() -> Vec<CacheInfo> {
     let mut caches = Vec::new();
 
-    // Pacman cache
-    let pacman_cache = "/var/cache/pacman/pkg";
-    if let Ok(info) = get_dir_size(pacman_cache) {
-        caches.push(info);
+    if command_exists("pacman") {
+        let pacman_cache = "/var/cache/pacman/pkg";
+        if let Ok(info) = get_dir_size(pacman_cache) {
+            caches.push(info);
+        }
     }
 
-    // AUR cache (usually in ~/.cache/paru or ~/.cache/yay)
-    if let Ok(home) = std::env::var("HOME") {
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
         let aur_caches = [
             format!("{}/.cache/paru", home),
             format!("{}/.cache/yay", home),
@@ -419,7 +320,6 @@ fn get_dir_size(path: &str) -> Result<CacheInfo, std::io::Error> {
                 total_size += metadata.len();
                 file_count += 1;
             } else if metadata.is_dir() {
-                // Recursively count files in subdirectories
                 if let Ok(sub_info) = get_dir_size(&entry.path().to_string_lossy()) {
                     total_size += sub_info.size_bytes;
                     file_count += sub_info.file_count;
@@ -429,7 +329,6 @@ fn get_dir_size(path: &str) -> Result<CacheInfo, std::io::Error> {
     }
 
     let size_formatted = format_size(total_size);
-
     Ok(CacheInfo {
         path: path.to_string(),
         size_bytes: total_size,
@@ -460,9 +359,11 @@ pub struct ForeignPackage {
 }
 
 pub fn get_foreign_packages() -> Vec<ForeignPackage> {
-    let mut packages = Vec::new();
+    if !command_exists("pacman") {
+        return Vec::new();
+    }
 
-    // Get foreign (AUR/explicit) packages using pacman -Qmq
+    let mut packages = Vec::new();
     let output = Command::new("pacman")
         .args(["-Qmq", "--color", "never"])
         .output();
@@ -470,12 +371,10 @@ pub fn get_foreign_packages() -> Vec<ForeignPackage> {
     if let Ok(output) = output {
         if output.status.success() {
             let content = String::from_utf8_lossy(&output.stdout);
-
             for line in content.lines() {
                 let pkg_name = line.trim();
                 if !pkg_name.is_empty() {
-                    // Get version info
-                    if let Ok(info) = get_package_info(pkg_name) {
+                    if let Ok(info) = get_package_info_pacman(pkg_name) {
                         packages.push(ForeignPackage {
                             name: pkg_name.to_string(),
                             version: info.0,
@@ -486,18 +385,13 @@ pub fn get_foreign_packages() -> Vec<ForeignPackage> {
             }
         }
     }
-
     packages
 }
 
-fn get_package_info(pkg_name: &str) -> Result<(String, String), std::io::Error> {
+fn get_package_info_pacman(pkg_name: &str) -> Result<(String, String), std::io::Error> {
     let output = Command::new("pacman").args(["-Qi", pkg_name]).output()?;
-
     if !output.status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "Package not found",
-        ));
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Package not found"));
     }
 
     let content = String::from_utf8_lossy(&output.stdout);
@@ -511,15 +405,13 @@ fn get_package_info(pkg_name: &str) -> Result<(String, String), std::io::Error> 
             source = line.split(':').nth(1).unwrap_or("").trim().to_string();
         }
     }
-
     Ok((version, source))
 }
 
-pub fn get_foreign_packages_count() -> usize {
-    get_foreign_packages().len()
-}
-
 pub fn get_repository_packages_count() -> usize {
+    if !command_exists("pacman") {
+        return 0;
+    }
     let output = Command::new("pacman")
         .args(["-Qq", "--color", "never"])
         .output();
@@ -527,7 +419,7 @@ pub fn get_repository_packages_count() -> usize {
     if let Ok(output) = output {
         if output.status.success() {
             let total = String::from_utf8_lossy(&output.stdout).lines().count();
-            let foreign = get_foreign_packages_count();
+            let foreign = get_foreign_packages().len();
             return total.saturating_sub(foreign);
         }
     }
@@ -541,8 +433,10 @@ pub struct PackageGroup {
 }
 
 pub fn get_package_groups() -> Vec<PackageGroup> {
+    if !command_exists("pacman") {
+        return Vec::new();
+    }
     let mut groups = Vec::new();
-
     let output = Command::new("pacman")
         .args(["-Sg", "--color", "never"])
         .output();
@@ -550,22 +444,17 @@ pub fn get_package_groups() -> Vec<PackageGroup> {
     if let Ok(output) = output {
         if output.status.success() {
             let content = String::from_utf8_lossy(&output.stdout);
-
             for line in content.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 2 {
-                    let group_name = parts[0];
-                    let members: usize = parts.len() - 1;
                     groups.push(PackageGroup {
-                        name: group_name.to_string(),
-                        member_count: members,
+                        name: parts[0].to_string(),
+                        member_count: parts.len() - 1,
                     });
                 }
             }
         }
     }
-
-    // Sort by member count descending
     groups.sort_by(|a, b| b.member_count.cmp(&a.member_count));
     groups
 }
