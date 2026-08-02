@@ -66,13 +66,13 @@ The universal installer will automatically download the source, install Rust if 
 #### Linux / macOS
 Open your terminal and run:
 ```bash
-curl -sSL https://raw.githubusercontent.com/sreevarshan-xenoz/metapak/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/sreevarshan-xenoz/metapak/master/install.sh | bash
 ```
 
 #### Windows (PowerShell)
 Open PowerShell and run:
 ```powershell
-irm https://raw.githubusercontent.com/sreevarshan-xenoz/metapak/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/sreevarshan-xenoz/metapak/master/install.ps1 | iex
 ```
 
 ### Manual Installation
